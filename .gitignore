@@ -30,3 +30,6 @@ Thumbs.db
 
 # Local sample data
 dummy/
+
+# Agent guidance (local)
+AGENTS.md
