@@ -2,6 +2,8 @@
 
 A Streamlit web application for encrypting and decrypting KoboToolbox form submissions using RSA and AES encryption.
 
+![App Screenshot](screenshot.png)
+
 ## Features
 
 - **Connect to KoboToolbox** - Authenticate with your KoboToolbox server
