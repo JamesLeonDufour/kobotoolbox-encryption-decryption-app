@@ -364,14 +364,7 @@ def extract_records_from_json_obj(data) -> list[dict]:
         for att in attachments:
             if not isinstance(att, dict):
                 continue
-            filename = att.get("filename", "") or ""
-            basename = att.get("media_file_basename", "") or ""
-            is_submission = (
-                basename == "submission.xml.enc"
-                or filename.endswith("/submission.xml.enc")
-                or filename.endswith("\\submission.xml.enc")
-            )
-            if is_submission and submission_att is None:
+            if is_submission_attachment(att) and submission_att is None:
                 submission_att = att
             else:
                 media_count += 1
@@ -391,11 +384,22 @@ def extract_records_from_json_obj(data) -> list[dict]:
 
 def fetch_kobo_assets(server_url: str, api_token: str) -> list[dict]:
     headers = {"Authorization": f"Token {api_token}"}
-    resp = requests.get(f"{server_url}/api/v2/assets/", headers=headers, timeout=REQUEST_TIMEOUT)
-    if resp.status_code != 200:
-        raise ValueError(f"Assets fetch failed: {resp.status_code}")
-    data = resp.json()
-    return data.get("results", []) if isinstance(data, dict) else []
+    url = f"{server_url}/api/v2/assets/"
+    assets: list[dict] = []
+    while url:
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            raise ValueError(f"Assets fetch failed: {resp.status_code}")
+        data = resp.json()
+        if isinstance(data, dict) and isinstance(data.get("results"), list):
+            assets.extend(data["results"])
+            url = data.get("next")
+        elif isinstance(data, list):
+            assets.extend(data)
+            url = None
+        else:
+            url = None
+    return assets
 
 
 def fetch_kobo_data_records(server_url: str, api_token: str, asset_uid: str) -> list[dict]:
@@ -437,18 +441,31 @@ def fetch_kobo_record_attachments(
     return []
 
 
+def is_submission_attachment(att: dict) -> bool:
+    filename = att.get("filename", "") or ""
+    basename = att.get("media_file_basename", "") or ""
+    return (
+        basename == "submission.xml.enc"
+        or filename.endswith("/submission.xml.enc")
+        or filename.endswith("\\submission.xml.enc")
+    )
+
+
+def count_media_attachments(attachments: list[dict]) -> int:
+    count = 0
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        if not is_submission_attachment(att):
+            count += 1
+    return count
+
+
 def select_submission_attachment(attachments: list[dict]) -> dict | None:
     for att in attachments:
         if not isinstance(att, dict):
             continue
-        filename = att.get("filename", "") or ""
-        basename = att.get("media_file_basename", "") or ""
-        is_submission = (
-            basename == "submission.xml.enc"
-            or filename.endswith("/submission.xml.enc")
-            or filename.endswith("\\submission.xml.enc")
-        )
-        if is_submission:
+        if is_submission_attachment(att):
             return att
     return None
 
@@ -562,9 +579,21 @@ with st.sidebar:
     selected_asset_uid = ""
     selected_asset_name = ""
     if assets:
-        choices = {a.get("name", a.get("uid", "(unnamed)")): a.get("uid") for a in assets}
-        selected_asset_name = st.selectbox("Select project", list(choices.keys()))
-        selected_asset_uid = choices.get(selected_asset_name) or ""
+        asset_items = [
+            {
+                "uid": a.get("uid") or "",
+                "name": a.get("name") or "(unnamed)",
+            }
+            for a in assets
+        ]
+        selected_asset = st.selectbox(
+            "Select project",
+            asset_items,
+            format_func=lambda item: f"{item['name']} ({item['uid']})" if item["uid"] else item["name"],
+        )
+        if selected_asset:
+            selected_asset_uid = selected_asset.get("uid") or ""
+            selected_asset_name = selected_asset.get("name") or ""
     else:
         st.info("Connect to load projects.")
 
@@ -724,9 +753,6 @@ if run_clicked:
                         progress.progress(idx / total)
                         continue
 
-                    iv = derive_iv(inst_id, aes_key, mcount + 1)
-                    log_lines.append(f"record_{idx}_iv={iv.hex()}")
-
                     meta = record_meta_map.get(inst_id) or {}
                     record_id = rec.get("record_id") or meta.get("record_id")
                     att_url = rec.get("attachment_url") or meta.get("attachment_url")
@@ -747,6 +773,8 @@ if run_clicked:
                                     record_id,
                                 )
                                 submission_att = select_submission_attachment(attachments)
+                                mcount = count_media_attachments(attachments)
+                                log_lines.append(f"record_{idx}_media_count_from_attachments={mcount}")
                                 attachments_cache[cache_key] = submission_att
                             except Exception as e:
                                 attachments_cache[cache_key] = None
@@ -763,6 +791,9 @@ if run_clicked:
                         log_lines.append(f"record_{idx}_attachment_url=missing")
                         progress.progress(idx / total)
                         continue
+
+                    iv = derive_iv(inst_id, aes_key, mcount + 1)
+                    log_lines.append(f"record_{idx}_iv={iv.hex()}")
 
                     headers = {"Authorization": f"Token {st.session_state.api_token}"}
                     try:
