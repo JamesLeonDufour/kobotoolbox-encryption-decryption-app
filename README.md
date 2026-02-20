@@ -101,12 +101,9 @@ kobo-encrypt/
 |-- README.md              # This file
 |-- .gitignore             # Git ignore rules
 |-- AGENTS.md              # AI agent guidance
-`-- dummy/                 # Example/test files
-    |-- private_key.pem    # Example private key
-    |-- public_key.pem     # Example public key
-    |-- submission.xml.enc # Encrypted submission
-    `-- encrypt_example.xlsx # Example encrypted data
+
 ```
+
 
 ## Future Development Ideas
 
@@ -119,7 +116,3 @@ These are good next steps, but they depend on KoboToolbox API support and permis
 ## License
 
 MIT License
-
-## Author
-
-Created for KoboToolbox encrypted form management.
