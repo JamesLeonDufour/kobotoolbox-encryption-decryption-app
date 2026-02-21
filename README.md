@@ -40,7 +40,21 @@ pip install -r requirements.txt
 
 ## Quick Start (One Command)
 
-For beginners (Linux/macOS/Git Bash), use the helper script:
+For beginners, use the helper launcher for your shell:
+
+### Windows PowerShell
+
+```powershell
+.\start.ps1
+```
+
+If script execution is blocked:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+### Linux/macOS/Git Bash
 
 ```bash
 # from project root
@@ -137,6 +151,13 @@ Option B (from this app):
 - Some self-hosted Kobo versions do not expose the same update/redeploy endpoints
 - Use manual encryption settings and redeploy in KoboToolbox UI
 
+### `bash start.sh` fails with `ensurepip is not available`
+- You are likely using WSL/Linux Python without venv support.
+- On Debian/Ubuntu/WSL, run:
+  - `sudo apt update && sudo apt install python3-venv`
+- On Windows PowerShell, use:
+  - `.\start.ps1`
+
 ### Notes on public key format
 - The app validates PEM keys but sends `settings.public_key` to Kobo API without `BEGIN/END` envelope lines.
 - The app also sets `settings.submission_url` based on the connected server host.
@@ -148,6 +169,7 @@ kobo-encrypt/
 |-- app.py                 # Main Streamlit application
 |-- requirements.txt       # Python dependencies
 |-- start.sh               # Beginner one-command launcher
+|-- start.ps1              # Beginner launcher for PowerShell
 |-- README.md              # This file
 |-- AGENTS.md              # Agent guidance
 |-- .gitignore             # Git ignore rules
