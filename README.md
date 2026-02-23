@@ -124,6 +124,3 @@ kobotoolbox-encryption-decryption-app/
 
 ```
 
-## License
-
-MIT License

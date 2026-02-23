@@ -28,9 +28,6 @@ Thumbs.db
 # Streamlit
 .streamlit/
 
-# Local sample data
-dummy/
-
 # Agent guidance (local)
 AGENTS.md
 agents.md
