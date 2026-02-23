@@ -1,4 +1,4 @@
-# KoboToolbox Decryption App
+# KoboToolbox Encryption and Decryption App
 
 A Streamlit web application for encrypting and decrypting KoboToolbox form submissions using RSA and AES encryption.
 
@@ -31,33 +31,12 @@ A Streamlit web application for encrypting and decrypting KoboToolbox form submi
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd kobo-encrypt
+git clone https://github.com/JamesLeonDufour/kobotoolbox-encryption-decryption-app.git
+cd kobotoolbox-encryption-decryption-app
 
 # Install dependencies
 pip install -r requirements.txt
 ```
-
-## Quick Start (One Command)
-
-For beginners (Linux/macOS/Git Bash), use the helper script:
-
-```bash
-# from project root
-chmod +x start.sh
-bash start.sh
-```
-
-If `chmod` is not needed on your shell, this is enough:
-
-```bash
-bash start.sh
-```
-
-What it does automatically:
-- Creates `.venv` if missing
-- Installs/updates dependencies
-- Starts Streamlit app
 
 ## Usage
 
@@ -133,24 +112,15 @@ Option B (from this app):
 - Your token does not have required project permissions
 - Try with an owner/admin token for that project
 
-### "Endpoint unsupported (404/405) during automation"
-- Some self-hosted Kobo versions do not expose the same update/redeploy endpoints
-- Use manual encryption settings and redeploy in KoboToolbox UI
 
-### Notes on public key format
-- The app validates PEM keys but sends `settings.public_key` to Kobo API without `BEGIN/END` envelope lines.
-- The app also sets `settings.submission_url` based on the connected server host.
 
 ## Project Structure
 
 ```
-kobo-encrypt/
+kobotoolbox-encryption-decryption-app/
 |-- app.py                 # Main Streamlit application
 |-- requirements.txt       # Python dependencies
-|-- start.sh               # Beginner one-command launcher
 |-- README.md              # This file
-|-- AGENTS.md              # Agent guidance
-|-- .gitignore             # Git ignore rules
 
 ```
 
