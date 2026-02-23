@@ -26,7 +26,7 @@ ERROR_DETAIL_LIMIT = 500
 
 # Set page config FIRST (required by Streamlit)
 st.set_page_config(
-    page_title="KoboToolbox Decryption App",
+    page_title="KoboToolbox Encryption and Decryption App",
     layout="wide",
 )
 
@@ -173,7 +173,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("KoboToolbox Decryption App")
+st.title("KoboToolbox Encryption and Decryption App")
 st.markdown("---")
 
 
@@ -1830,7 +1830,7 @@ with st.expander("Terminal (Expand/Collapse)", expanded=False):
 st.markdown("""
 ---
 <div style="text-align: center; color: #666; padding: 20px;">
-    <p><strong>KoboToolbox Decryption App</strong> | Secure Local Decryption</p>
+    <p><strong>KoboToolbox Encryption and Decryption App</strong> | Secure Local Encryption &amp; Decryption</p>
     <p><small>Your private key never leaves your browser. All decryption happens locally.</small></p>
 </div>
 """, unsafe_allow_html=True)
