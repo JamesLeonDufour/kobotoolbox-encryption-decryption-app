@@ -928,44 +928,294 @@ def confirm_redeploy_effect(
     return {"confirmed": False, "reason": "no_state_change_detected", "attempt": retries, "state": last_state, "error": last_error}
 
 
-def flatten_xml_fields(xml_bytes: bytes) -> dict[str, str]:
+def extract_repeat_paths_from_asset(asset: dict) -> set[str]:
+    repeat_paths: set[str] = set()
+    if not isinstance(asset, dict):
+        return repeat_paths
+
+    content = asset.get("content")
+    if not isinstance(content, dict):
+        return repeat_paths
+
+    survey = content.get("survey")
+    if not isinstance(survey, list):
+        return repeat_paths
+
+    stack: list[tuple[str, str]] = []
+
+    def stack_path() -> str:
+        return "/".join(name for _, name in stack if name)
+
+    for row in survey:
+        if not isinstance(row, dict):
+            continue
+        raw_type = str(row.get("type") or "").strip().lower()
+        if not raw_type:
+            continue
+        norm_type = raw_type.replace("-", "_").replace(" ", "_")
+        name = str(row.get("name") or "").strip()
+
+        if norm_type.startswith("begin_repeat"):
+            stack.append(("repeat", name))
+            path = stack_path()
+            if path:
+                repeat_paths.add(path)
+            continue
+
+        if norm_type.startswith("begin_group"):
+            stack.append(("group", name))
+            continue
+
+        if norm_type.startswith("end_repeat") or norm_type.startswith("end_group"):
+            if stack:
+                stack.pop()
+            continue
+
+    return repeat_paths
+
+
+def parse_xml_fields_and_repeats(
+    xml_bytes: bytes,
+    known_repeat_paths: set[str] | None = None,
+) -> tuple[dict[str, str], list[dict]]:
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as e:
         raise ValueError(f"XML parse error: {e}")
+    known_repeat_paths = known_repeat_paths or set()
 
     def local_name(tag: str) -> str:
         return tag.split("}", 1)[-1] if "}" in tag else tag
 
-    fields: dict[str, str] = {}
-    counts: dict[str, int] = {}
-
-    def add_field(path: str, value: str) -> None:
+    def add_field(fields: dict[str, str], counts: dict[str, int], path: str, value: str) -> None:
         key = path
         if key in fields:
             counts[key] = counts.get(key, 1) + 1
             key = f"{key}_{counts[key]}"
         fields[key] = value
 
-    def walk(elem: ET.Element, prefix: str) -> None:
+    repeat_rows: list[dict] = []
+    repeat_row_seq = 0
+
+    def next_repeat_row_uid() -> str:
+        nonlocal repeat_row_seq
+        repeat_row_seq += 1
+        return f"repeat_row_{repeat_row_seq}"
+
+    def walk(
+        elem: ET.Element,
+        prefix: str,
+        fields: dict[str, str],
+        counts: dict[str, int],
+        repeat_parent: dict | None = None,
+        absolute_prefix: str | None = None,
+    ) -> None:
+        abs_prefix = absolute_prefix if absolute_prefix is not None else prefix
         children = list(elem)
-        tag = local_name(elem.tag)
-        path = f"{prefix}/{tag}" if prefix else tag
         if not children:
             text = (elem.text or "").strip()
-            if text:
-                add_field(path, text)
+            if text and prefix:
+                add_field(fields, counts, prefix, text)
+            elif text and repeat_parent:
+                add_field(fields, counts, "_value", text)
             return
-        for child in children:
-            walk(child, path)
 
-    children = list(root)
-    if children:
+        child_name_counts: dict[str, int] = {}
         for child in children:
-            walk(child, "")
-    else:
-        walk(root, "")
+            name = local_name(child.tag)
+            child_name_counts[name] = child_name_counts.get(name, 0) + 1
+
+        repeat_index_by_name: dict[str, int] = {}
+        for child in children:
+            child_tag = local_name(child.tag)
+            child_path = f"{prefix}/{child_tag}" if prefix else child_tag
+            child_abs_path = f"{abs_prefix}/{child_tag}" if abs_prefix else child_tag
+
+            if child_name_counts.get(child_tag, 0) > 1 or child_abs_path in known_repeat_paths:
+                repeat_index_by_name[child_tag] = repeat_index_by_name.get(child_tag, 0) + 1
+                repeat_index = repeat_index_by_name[child_tag]
+                repeat_row_uid = next_repeat_row_uid()
+
+                repeat_fields: dict[str, str] = {}
+                repeat_counts: dict[str, int] = {}
+                walk(
+                    child,
+                    "",
+                    repeat_fields,
+                    repeat_counts,
+                    repeat_parent={
+                        "group": child_abs_path,
+                        "index": repeat_index,
+                        "uid": repeat_row_uid,
+                    },
+                    absolute_prefix=child_abs_path,
+                )
+
+                repeat_row: dict = {
+                    "repeat_group": child_abs_path,
+                    "repeat_index": repeat_index,
+                    "_repeat_row_uid": repeat_row_uid,
+                }
+                if repeat_parent:
+                    repeat_row["parent_repeat_group"] = repeat_parent.get("group")
+                    repeat_row["parent_repeat_index"] = repeat_parent.get("index")
+                    repeat_row["_parent_repeat_row_uid"] = repeat_parent.get("uid")
+                repeat_row.update(repeat_fields)
+                repeat_rows.append(repeat_row)
+                continue
+
+            walk(
+                child,
+                child_path,
+                fields,
+                counts,
+                repeat_parent=repeat_parent,
+                absolute_prefix=child_abs_path,
+            )
+
+    fields: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    # Start at the XML root so root-level single-item repeats can still be
+    # recognized via known_repeat_paths.
+    walk(root, "", fields, counts, absolute_prefix="")
+    return fields, repeat_rows
+
+
+def flatten_xml_fields(xml_bytes: bytes) -> dict[str, str]:
+    fields, _ = parse_xml_fields_and_repeats(xml_bytes)
     return fields
+
+
+def sanitize_excel_sheet_name(name: str, used_names: set[str]) -> str:
+    clean = re.sub(r'[\[\]\:\*\?\/\\]', "_", (name or "").strip())
+    clean = clean.strip("'") or "Sheet"
+    if len(clean) > 31:
+        digest = hashlib.sha1(clean.encode("utf-8")).hexdigest()[:6]
+        clean = f"{clean[:24]}_{digest}"
+    candidate = clean
+    suffix = 2
+    while candidate in used_names:
+        suffix_text = f"_{suffix}"
+        base = clean[: 31 - len(suffix_text)] or "Sheet"
+        candidate = f"{base}{suffix_text}"
+        suffix += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def submission_metadata_columns_for_repeat(parent_row: dict) -> dict[str, object]:
+    if not isinstance(parent_row, dict):
+        return {}
+    allowed = (
+        "_id",
+        "_uuid",
+        "_submission_time",
+        "_validation_status",
+        "_notes",
+        "_status",
+        "_submitted_by",
+        "__version__",
+        "_tags",
+        "meta/rootUuid",
+    )
+    fields: dict[str, object] = {}
+    for key in allowed:
+        if key in parent_row and parent_row.get(key) is not None:
+            fields[f"_submission_{key}"] = parent_row.get(key)
+    return fields
+
+
+def build_repeat_sheet_name_map(
+    grouped_repeat_rows: dict[str, list[dict]],
+    main_sheet_name: str,
+) -> dict[str, str]:
+    used_sheet_names = {main_sheet_name}
+    mapping: dict[str, str] = {}
+    for repeat_group in grouped_repeat_rows.keys():
+        group_tail = repeat_group.split("/")[-1] if repeat_group else "repeat"
+        sheet_name = sanitize_excel_sheet_name(group_tail or "repeat", used_sheet_names)
+        mapping[repeat_group] = sheet_name
+    return mapping
+
+
+def apply_repeat_parent_table_names(
+    repeat_rows: list[dict],
+    main_sheet_name: str,
+    repeat_sheet_name_map: dict[str, str],
+) -> list[dict]:
+    rows = [copy.deepcopy(r) for r in repeat_rows]
+    for row in rows:
+        parent_name = str(row.get("_parent_table_name") or "").strip()
+        if not parent_name:
+            row["_parent_table_name"] = main_sheet_name
+            continue
+        if parent_name == "__main__":
+            row["_parent_table_name"] = main_sheet_name
+            continue
+        row["_parent_table_name"] = repeat_sheet_name_map.get(parent_name, parent_name)
+    return rows
+
+
+def prepare_repeat_rows_for_export(
+    repeat_rows: list[dict],
+    parent_rows: list[dict] | None = None,
+) -> list[dict]:
+    rows = [copy.deepcopy(r) for r in repeat_rows]
+    if not rows:
+        return rows
+
+    group_counts: dict[str, int] = {}
+    uid_to_group: dict[str, str] = {}
+    uid_to_index: dict[str, int] = {}
+    parent_by_index: dict[int, dict] = {}
+    if parent_rows:
+        for parent in parent_rows:
+            if not isinstance(parent, dict):
+                continue
+            parent_index = parent.get("_index")
+            if isinstance(parent_index, int):
+                parent_by_index[parent_index] = parent
+
+    for row in rows:
+        group = str(row.get("repeat_group") or "repeats")
+        group_counts[group] = group_counts.get(group, 0) + 1
+        row["_index"] = group_counts[group]
+
+        row_uid = str(row.get("_repeat_row_uid") or "").strip()
+        if row_uid:
+            uid_to_group[row_uid] = group
+            uid_to_index[row_uid] = row["_index"]
+
+    for row in rows:
+        parent_uid = str(row.get("_parent_repeat_row_uid") or "").strip()
+        parent_index = row.get("_main_parent_index")
+        if isinstance(parent_index, int) and parent_index in parent_by_index:
+            row.update(submission_metadata_columns_for_repeat(parent_by_index[parent_index]))
+        if parent_uid:
+            row["_parent_index"] = uid_to_index.get(parent_uid, "")
+            row["_parent_table_name"] = uid_to_group.get(parent_uid, "")
+        else:
+            row["_parent_index"] = row.get("_main_parent_index", "")
+            row["_parent_table_name"] = "__main__"
+
+    for row in rows:
+        row.pop("_repeat_row_uid", None)
+        row.pop("_parent_repeat_row_uid", None)
+        row.pop("_main_parent_index", None)
+
+    return rows
+
+
+def group_repeat_rows_by_group(repeat_rows: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    first_seen: dict[str, int] = {}
+    for row in repeat_rows:
+        group = str(row.get("repeat_group") or "repeats")
+        if group not in first_seen:
+            first_seen[group] = len(first_seen)
+        grouped.setdefault(group, []).append(row)
+    ordered_keys = sorted(grouped.keys(), key=lambda key: (key.count("/"), first_seen.get(key, 0), key))
+    return {key: grouped[key] for key in ordered_keys}
 
 
 def derive_iv(instance_id: str, aes_key: bytes, file_index: int) -> bytes:
@@ -1032,7 +1282,7 @@ def extract_records_from_json_obj(data) -> list[dict]:
                 "b64_key": b64_key,
                 "record_id": record_id,
                 "media_count": media_count,
-                "attachment_url": submission_att.get("download_url") if submission_att else None,
+                "attachment_url": attachment_download_url(submission_att) if submission_att else None,
                 "attachment_name": submission_att.get("filename") if submission_att else None,
             })
 
@@ -1090,13 +1340,25 @@ def fetch_kobo_record_attachments(
 
 
 def is_submission_attachment(att: dict) -> bool:
-    filename = att.get("filename", "") or ""
-    basename = att.get("media_file_basename", "") or ""
+    filename = str(att.get("filename", "") or "").strip().lower()
+    basename = str(att.get("media_file_basename", "") or "").strip().lower()
+    candidate = basename or filename.split("/")[-1].split("\\")[-1]
     return (
-        basename == "submission.xml.enc"
+        candidate == "submission.xml.enc"
         or filename.endswith("/submission.xml.enc")
         or filename.endswith("\\submission.xml.enc")
+        or (candidate.endswith(".xml.enc") and "submission" in candidate)
     )
+
+
+def attachment_download_url(att: dict) -> str:
+    if not isinstance(att, dict):
+        return ""
+    for key in ("download_url", "download_large_url", "url"):
+        value = str(att.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def is_encrypted_media_attachment(att: dict) -> bool:
@@ -1193,6 +1455,28 @@ def select_submission_attachment(attachments: list[dict]) -> dict | None:
     return None
 
 
+def extract_submission_metadata_fields_from_record(rec: dict) -> dict[str, object]:
+    if not isinstance(rec, dict):
+        return {}
+    keys = (
+        "_id",
+        "_uuid",
+        "_submission_time",
+        "_validation_status",
+        "_notes",
+        "_status",
+        "_submitted_by",
+        "__version__",
+        "_tags",
+        "meta/rootUuid",
+    )
+    fields: dict[str, object] = {}
+    for key in keys:
+        if key in rec and rec.get(key) is not None:
+            fields[key] = rec.get(key)
+    return fields
+
+
 def build_record_meta_map(records: list[dict]) -> dict[str, dict]:
     mapping: dict[str, dict] = {}
     for rec in records:
@@ -1213,9 +1497,10 @@ def build_record_meta_map(records: list[dict]) -> dict[str, dict]:
         submission_att = select_submission_attachment(attachments) if attachments else None
         mapping[instance_id] = {
             "record_id": record_id,
-            "attachment_url": submission_att.get("download_url") if submission_att else None,
+            "attachment_url": attachment_download_url(submission_att) if submission_att else None,
             "attachment_name": submission_att.get("filename") if submission_att else None,
             "attachments": attachments,
+            "submission_meta_fields": extract_submission_metadata_fields_from_record(rec),
         }
     return mapping
 
@@ -1237,6 +1522,12 @@ if "generated_public_pem" not in st.session_state:
     st.session_state.generated_public_pem = b""
 if "last_decrypted_rows" not in st.session_state:
     st.session_state.last_decrypted_rows = []
+if "last_repeat_rows" not in st.session_state:
+    st.session_state.last_repeat_rows = []
+if "last_main_sheet_name" not in st.session_state:
+    st.session_state.last_main_sheet_name = "decrypted"
+if "last_repeat_sheet_name_map" not in st.session_state:
+    st.session_state.last_repeat_sheet_name_map = {}
 if "last_decrypted_excel_bytes" not in st.session_state:
     st.session_state.last_decrypted_excel_bytes = b""
 if "last_decrypted_excel_filename" not in st.session_state:
@@ -1668,7 +1959,11 @@ if st.session_state.last_encryption_summary:
             )
     st.markdown("---")
 
-if not st.session_state.last_encryption_summary and not st.session_state.last_decrypted_rows:
+if (
+    not run_clicked
+    and not st.session_state.last_encryption_summary
+    and not st.session_state.last_decrypted_rows
+):
     st.markdown("""
     <div class="info-box">
         <h3>Getting Started</h3>
@@ -1691,6 +1986,9 @@ if run_clicked:
         st.error("Please upload a private key or generate a new key pair.")
     else:
         st.session_state.last_decrypted_rows = []
+        st.session_state.last_repeat_rows = []
+        st.session_state.last_main_sheet_name = "decrypted"
+        st.session_state.last_repeat_sheet_name_map = {}
         st.session_state.last_decrypted_excel_bytes = b""
         st.session_state.last_decrypted_excel_filename = ""
         st.session_state.last_media_zip_bytes = b""
@@ -1698,10 +1996,27 @@ if run_clicked:
         log_lines: list[str] = []
         key_decrypt_failures = 0
         rsa_prefix_nonzero_count = 0
+        repeat_rows_all: list[dict] = []
+        known_repeat_paths: set[str] = set()
         try:
             log_lines.append(f"run_started_utc={utc_now_iso()}")
             log_lines.append(f"server_url={st.session_state.server_url}")
             log_lines.append(f"asset_uid={selected_asset_uid}")
+
+            try:
+                asset_for_schema = get_asset(
+                    st.session_state.server_url,
+                    st.session_state.api_token,
+                    selected_asset_uid,
+                )
+                known_repeat_paths = extract_repeat_paths_from_asset(asset_for_schema)
+                log_lines.append(f"repeat_paths_detected={len(known_repeat_paths)}")
+                if known_repeat_paths:
+                    log_lines.append(
+                        "repeat_paths=" + ",".join(sorted(known_repeat_paths))
+                    )
+            except Exception as e:
+                log_lines.append(f"repeat_schema_lookup_error={e}")
 
             # Load key
             key_source = "generated"
@@ -1777,6 +2092,11 @@ if run_clicked:
                             continue
 
                         meta = record_meta_map.get(inst_id) or {}
+                        submission_meta_fields = (
+                            meta.get("submission_meta_fields")
+                            if isinstance(meta.get("submission_meta_fields"), dict)
+                            else {}
+                        )
                         record_id = rec.get("record_id") or meta.get("record_id")
                         att_url = rec.get("attachment_url") or meta.get("attachment_url")
                         att_name = rec.get("attachment_name") or meta.get("attachment_name")
@@ -1805,14 +2125,24 @@ if run_clicked:
                         if attachments:
                             submission_att = select_submission_attachment(attachments)
                             if submission_att:
-                                att_url = submission_att.get("download_url") or att_url
+                                att_url = attachment_download_url(submission_att) or att_url
                                 att_name = submission_att.get("filename") or att_name
                                 log_lines.append("record_{idx}_attachment_lookup=attachments".format(idx=idx))
                             mcount = count_media_attachments(attachments)
                             log_lines.append(f"record_{idx}_media_count_from_attachments={mcount}")
 
                         if not att_url:
-                            failed.append((inst_id, "submission.xml.enc download_url not found"))
+                            attachment_names = []
+                            for att in attachments:
+                                if not isinstance(att, dict):
+                                    continue
+                                attachment_names.append(
+                                    str(att.get("media_file_basename") or att.get("filename") or "(unnamed)")
+                                )
+                            detail = "submission.xml.enc attachment/download URL not found"
+                            if attachment_names:
+                                detail += f" (attachments: {', '.join(attachment_names[:5])})"
+                            failed.append((inst_id, detail))
                             log_lines.append(f"record_{idx}_attachment_url=missing")
                             progress.progress(idx / total)
                             continue
@@ -1833,9 +2163,28 @@ if run_clicked:
                             row = {"instance_id": inst_id}
                             if record_id is not None:
                                 row["record_id"] = record_id
+                            if submission_meta_fields:
+                                row.update(submission_meta_fields)
+                            main_row_index = len(decrypted_rows) + 1
                             try:
-                                row.update(flatten_xml_fields(plaintext))
+                                xml_fields, repeat_rows = parse_xml_fields_and_repeats(
+                                    plaintext,
+                                    known_repeat_paths=known_repeat_paths,
+                                )
+                                row.update(xml_fields)
+                                row["_index"] = main_row_index
+                                for repeat_row in repeat_rows:
+                                    repeat_row["instance_id"] = inst_id
+                                    if record_id is not None:
+                                        repeat_row["record_id"] = record_id
+                                    repeat_row["_main_parent_index"] = main_row_index
+                                    repeat_rows_all.append(repeat_row)
+                                if repeat_rows:
+                                    log_lines.append(
+                                        f"record_{idx}_repeat_rows={len(repeat_rows)}"
+                                    )
                             except Exception as e:
+                                row["_index"] = main_row_index
                                 row["_raw_xml"] = plaintext.decode("utf-8", errors="replace")
                                 log_lines.append(f"record_{idx}_xml_parse_error={e}")
 
@@ -1844,6 +2193,8 @@ if run_clicked:
                             media_fail = 0
                             for media_index, media_att in enumerate(media_attachments, start=1):
                                 media_url = media_att.get("download_url")
+                                if not media_url:
+                                    media_url = attachment_download_url(media_att)
                                 if not media_url:
                                     media_fail += 1
                                     media_files_failed += 1
@@ -1899,13 +2250,40 @@ if run_clicked:
                 if success:
                     st.success(f"Decrypted {success} submission(s).")
                     export_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                    main_sheet_name_candidate = (selected_asset_name or "decrypted").strip() or "decrypted"
+                    main_sheet_name = sanitize_excel_sheet_name(main_sheet_name_candidate, set())
+                    repeat_rows_export = prepare_repeat_rows_for_export(
+                        repeat_rows_all,
+                        parent_rows=decrypted_rows,
+                    )
+                    grouped_repeat_rows_for_names = group_repeat_rows_by_group(repeat_rows_export)
+                    repeat_sheet_name_map = build_repeat_sheet_name_map(
+                        grouped_repeat_rows_for_names,
+                        main_sheet_name,
+                    )
+                    repeat_rows_export = apply_repeat_parent_table_names(
+                        repeat_rows_export,
+                        main_sheet_name,
+                        repeat_sheet_name_map,
+                    )
                     st.session_state.last_decrypted_rows = decrypted_rows
+                    st.session_state.last_repeat_rows = repeat_rows_export
+                    st.session_state.last_main_sheet_name = main_sheet_name
+                    st.session_state.last_repeat_sheet_name_map = repeat_sheet_name_map
                     df = pd.DataFrame(decrypted_rows)
                     excel_buf = io.BytesIO()
                     with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-                        df.to_excel(writer, index=False, sheet_name="decrypted")
+                        df.to_excel(writer, index=False, sheet_name=main_sheet_name)
+                        if repeat_rows_export:
+                            grouped_repeat_rows = group_repeat_rows_by_group(repeat_rows_export)
+                            for repeat_group, group_rows in grouped_repeat_rows.items():
+                                repeats_df = pd.DataFrame(group_rows)
+                                sheet_name = repeat_sheet_name_map.get(repeat_group, "repeat")
+                                repeats_df.to_excel(writer, index=False, sheet_name=sheet_name)
                     st.session_state.last_decrypted_excel_bytes = excel_buf.getvalue()
                     st.session_state.last_decrypted_excel_filename = f"decrypted_submissions_{export_stamp}.xlsx"
+                    if repeat_rows_export:
+                        st.info(f"Prepared repeat sheets with {len(repeat_rows_export)} row(s).")
                     if media_files_written > 0:
                         st.session_state.last_media_zip_bytes = media_zip_buf.getvalue()
                         st.session_state.last_media_zip_filename = f"decrypted_media_{export_stamp}.zip"
@@ -1940,10 +2318,39 @@ if run_clicked:
 if st.session_state.last_decrypted_rows:
     st.markdown("### Decrypted Data")
     df = pd.DataFrame(st.session_state.last_decrypted_rows)
-    if not df.empty:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    repeat_rows_for_ui = st.session_state.get("last_repeat_rows") or []
+    main_sheet_name_ui = str(st.session_state.get("last_main_sheet_name") or "Main")
+    repeat_sheet_name_map_ui = (
+        st.session_state.get("last_repeat_sheet_name_map")
+        if isinstance(st.session_state.get("last_repeat_sheet_name_map"), dict)
+        else {}
+    )
+    if repeat_rows_for_ui:
+        grouped_repeat_rows = group_repeat_rows_by_group(repeat_rows_for_ui)
+        tab_labels = [main_sheet_name_ui] + [
+            f"{repeat_sheet_name_map_ui.get(group, group.split('/')[-1] if group else 'repeat')} ({len(rows)})"
+            for group, rows in grouped_repeat_rows.items()
+        ]
+        tabs = st.tabs(tab_labels)
+        with tabs[0]:
+            if not df.empty:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No data to display.")
+        for i, (repeat_group, rows) in enumerate(grouped_repeat_rows.items(), start=1):
+            with tabs[i]:
+                sheet_label = repeat_sheet_name_map_ui.get(repeat_group, repeat_group.split("/")[-1] if repeat_group else "repeat")
+                st.caption(f"Repeat group: `{repeat_group}` | Sheet: `{sheet_label}`")
+                repeat_df = pd.DataFrame(rows)
+                if not repeat_df.empty:
+                    st.dataframe(repeat_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No repeat rows.")
     else:
-        st.info("No data to display.")
+        if not df.empty:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No data to display.")
     
     if st.session_state.last_decrypted_excel_bytes:
         col_dl1, col_dl2 = st.columns(2)
