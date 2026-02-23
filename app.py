@@ -94,6 +94,24 @@ st.markdown("""
     div.stButton > button[kind="primary"]:hover {
         background: #002a3f;
     }
+
+    /* Disabled buttons should not keep the active primary blue styling */
+    div.stButton > button:disabled,
+    div.stButton > button[kind="primary"]:disabled {
+        background: #e9ecef !important;
+        color: #6c757d !important;
+        border: 1px solid #ced4da !important;
+        box-shadow: none !important;
+        transform: none !important;
+        cursor: not-allowed !important;
+        opacity: 1 !important;
+    }
+    div.stButton > button:disabled:hover,
+    div.stButton > button[kind="primary"]:disabled:hover {
+        background: #e9ecef !important;
+        box-shadow: none !important;
+        transform: none !important;
+    }
     
     /* Status indicators */
     .status-connected {
@@ -316,6 +334,110 @@ def trigger_browser_download(file_name: str, data: bytes, mime: str) -> None:
         height=0,
         width=0,
     )
+
+
+def require_generated_private_key_download_confirmation() -> bool:
+    return bool(
+        st.session_state.get("generated_public_pem")
+        and st.session_state.get("generated_private_pem")
+        and not st.session_state.get("generated_private_key_download_confirmed", False)
+    )
+
+
+def open_private_key_confirmation_prompt(auto_proceed: bool = False) -> None:
+    st.session_state.show_private_key_confirm_dialog = True
+    st.session_state.private_key_confirm_auto_proceed = auto_proceed
+
+
+def render_private_key_confirmation_prompt() -> None:
+    if not st.session_state.get("show_private_key_confirm_dialog"):
+        return
+
+    def _render_dialog_contents() -> None:
+        st.markdown(
+            """
+            <style>
+            [data-testid="stDialog"] div.stButton > button[kind="primary"]:disabled {
+                background: #dc3545 !important;
+                color: #ffffff !important;
+                border: 1px solid #dc3545 !important;
+                opacity: 1 !important;
+                box-shadow: none !important;
+                transform: none !important;
+            }
+            [data-testid="stDialog"] div.stButton > button[kind="primary"]:not(:disabled) {
+                background: #28a745 !important;
+                color: #ffffff !important;
+                border: 1px solid #28a745 !important;
+            }
+            [data-testid="stDialog"] div.stButton > button[kind="primary"]:not(:disabled):hover {
+                background: #218838 !important;
+                border-color: #218838 !important;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.15) !important;
+                transform: translateY(-2px) !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.warning(
+            "Download and store the private key before encrypting the form. "
+            "You will need it later to decrypt submissions."
+        )
+        private_key_bytes = st.session_state.get("generated_private_pem") or b""
+        if private_key_bytes:
+            downloaded_now = st.download_button(
+                "Download Private Key",
+                data=private_key_bytes,
+                file_name="private_key.pem",
+                mime="application/x-pem-file",
+                use_container_width=True,
+                key="confirm_modal_download_private_key",
+            )
+            if downloaded_now:
+                st.session_state.generated_private_key_download_confirmed = True
+                st.success("Private key download confirmed.")
+        else:
+            st.error("No generated private key found. Generate a key pair first.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            continue_clicked = st.button(
+                "Continue to Encrypt",
+                type="primary",
+                use_container_width=True,
+                disabled=not st.session_state.get("generated_private_key_download_confirmed", False),
+                key="confirm_modal_continue_encrypt",
+            )
+        with col2:
+            cancel_clicked = st.button(
+                "Cancel",
+                use_container_width=True,
+                key="confirm_modal_cancel",
+            )
+
+        if continue_clicked:
+            st.session_state.show_private_key_confirm_dialog = False
+            if st.session_state.get("private_key_confirm_auto_proceed"):
+                st.session_state.pending_encrypt_after_private_key_confirm = True
+            st.session_state.private_key_confirm_auto_proceed = False
+            st.rerun()
+
+        if cancel_clicked:
+            st.session_state.show_private_key_confirm_dialog = False
+            st.session_state.private_key_confirm_auto_proceed = False
+            st.rerun()
+
+    if hasattr(st, "dialog"):
+        @st.dialog("Confirm Private Key Download")
+        def _private_key_dialog() -> None:
+            _render_dialog_contents()
+
+        _private_key_dialog()
+    else:
+        with st.container(border=True):
+            st.markdown("#### Confirm Private Key Download")
+            _render_dialog_contents()
 
 
 class KoboApiError(ValueError):
@@ -1141,6 +1263,14 @@ if "last_terminal_log_filename" not in st.session_state:
     st.session_state.last_terminal_log_filename = ""
 if "last_encryption_summary" not in st.session_state:
     st.session_state.last_encryption_summary = {}
+if "generated_private_key_download_confirmed" not in st.session_state:
+    st.session_state.generated_private_key_download_confirmed = False
+if "show_private_key_confirm_dialog" not in st.session_state:
+    st.session_state.show_private_key_confirm_dialog = False
+if "private_key_confirm_auto_proceed" not in st.session_state:
+    st.session_state.private_key_confirm_auto_proceed = False
+if "pending_encrypt_after_private_key_confirm" not in st.session_state:
+    st.session_state.pending_encrypt_after_private_key_confirm = False
 
 # Sidebar with improved sections
 with st.sidebar:
@@ -1237,6 +1367,10 @@ with st.sidebar:
                 priv_pem, pub_pem = generate_rsa_keypair()
                 st.session_state.generated_private_pem = priv_pem
                 st.session_state.generated_public_pem = pub_pem
+                st.session_state.generated_private_key_download_confirmed = False
+                st.session_state.show_private_key_confirm_dialog = False
+                st.session_state.private_key_confirm_auto_proceed = False
+                st.session_state.pending_encrypt_after_private_key_confirm = False
                 st.success("Key pair generated.")
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 trigger_browser_download(
@@ -1260,13 +1394,15 @@ with st.sidebar:
             )
             col1, col2 = st.columns(2)
             with col1:
-                st.download_button(
+                private_key_downloaded = st.download_button(
                     "Download Private Key",
                     data=st.session_state.generated_private_pem,
                     file_name="private_key.pem",
                     mime="application/x-pem-file",
                     use_container_width=True,
                 )
+                if private_key_downloaded:
+                    st.session_state.generated_private_key_download_confirmed = True
             with col2:
                 st.download_button(
                     "Download Public Key",
@@ -1279,12 +1415,34 @@ with st.sidebar:
     st.markdown("#### Encrypt Form and Redeploy")
     st.caption("Push the public key to the selected project and trigger redeploy.")
     can_automate = bool(st.session_state.server_url and st.session_state.api_token and selected_asset_uid)
-    push_and_redeploy_clicked = st.button(
+    requires_private_key_confirmation = require_generated_private_key_download_confirmation()
+    if requires_private_key_confirmation:
+        st.warning(
+            "Encryption is disabled until the generated private key is downloaded and confirmed."
+        )
+
+    encrypt_help = "Uses generated public key first, otherwise derives from uploaded private key."
+    if requires_private_key_confirmation:
+        encrypt_help += " Download/confirm the private key first."
+
+    encrypt_button_clicked = st.button(
         "Push Public Key + Redeploy",
         use_container_width=True,
         disabled=not can_automate,
-        help="Uses generated public key first, otherwise derives from uploaded private key.",
+        help=encrypt_help,
     )
+
+    if encrypt_button_clicked and requires_private_key_confirmation:
+        open_private_key_confirmation_prompt(auto_proceed=True)
+        encrypt_button_clicked = False
+
+    render_private_key_confirmation_prompt()
+    pending_encrypt_after_confirm = bool(
+        st.session_state.get("pending_encrypt_after_private_key_confirm", False)
+    )
+    if pending_encrypt_after_confirm:
+        st.session_state.pending_encrypt_after_private_key_confirm = False
+    push_and_redeploy_clicked = encrypt_button_clicked or pending_encrypt_after_confirm
 
     if push_and_redeploy_clicked:
         auto_lines = [f"automation_started_utc={utc_now_iso()}", f"asset_uid={selected_asset_uid}"]
