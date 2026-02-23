@@ -1416,10 +1416,6 @@ with st.sidebar:
     st.caption("Push the public key to the selected project and trigger redeploy.")
     can_automate = bool(st.session_state.server_url and st.session_state.api_token and selected_asset_uid)
     requires_private_key_confirmation = require_generated_private_key_download_confirmation()
-    if requires_private_key_confirmation:
-        st.warning(
-            "Encryption is disabled until the generated private key is downloaded and confirmed."
-        )
 
     encrypt_help = "Uses generated public key first, otherwise derives from uploaded private key."
     if requires_private_key_confirmation:
